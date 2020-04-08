@@ -180,8 +180,9 @@ object IouMain extends App with StrictLogging {
     t1 = System.nanoTime
   } yield {
     val millis = (t1 - t0) / 1000 / 1000
+    val seconds = millis.toDouble / 1000
 
-    println(s"completed $ncommands in ${millis}ms")
+    println(s"completed $ncommands in ${millis}ms, ${ncommands / seconds} per second.")
 
   }
 
