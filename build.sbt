@@ -7,6 +7,7 @@ version in ThisBuild := "0.0.1"
 scalaVersion in ThisBuild := "2.12.8"
 isSnapshot := true
 
+
 lazy val parent = project
   .in(file("."))
   .settings(
@@ -31,6 +32,12 @@ lazy val `application` = project
     name := "application",
     commonSettings,
     libraryDependencies ++= codeGenDependencies ++ applicationDependencies,
+    assemblyMergeStrategy in assembly := {
+      case x if Assembly.isConfigFile(x) =>
+        MergeStrategy.concat
+      case "META-INF/MANIFEST.MF" => MergeStrategy.discard
+      case x => MergeStrategy.first
+    }
   )
   .dependsOn(`scala-codegen`)
 // </doc-ref:modules>

@@ -3,33 +3,27 @@
 
 package com.digitalasset.quickstart.iou
 
-import java.time.Instant
-
-import akka.stream.scaladsl.Sink
 import akka.actor.ActorSystem
 import akka.stream.Materializer
+import akka.stream.scaladsl.Sink
 import com.digitalasset.api.util.TimeProvider
 import com.digitalasset.grpc.adapter.AkkaExecutionSequencerPool
 import com.digitalasset.ledger.api.refinements.ApiTypes.{ApplicationId, WorkflowId}
 import com.digitalasset.ledger.api.v1.ledger_offset.LedgerOffset
 import com.digitalasset.ledger.client.LedgerClient
 import com.digitalasset.ledger.client.binding.Contract
-import com.digitalasset.ledger.client.configuration.{
-  CommandClientConfiguration,
-  LedgerClientConfiguration,
-  LedgerIdRequirement
-}
-import com.digitalasset.quickstart.iou.ClientUtil.workflowIdFromParty
-import com.digitalasset.quickstart.iou.DecodeUtil.{decodeAllCreated, decodeArchived, decodeCreated}
-import com.digitalasset.quickstart.iou.FutureUtil.toFuture
-import com.typesafe.scalalogging.StrictLogging
+import com.digitalasset.ledger.client.configuration.{CommandClientConfiguration, LedgerClientConfiguration, LedgerIdRequirement}
 import com.digitalasset.ledger.client.services.commands.CompletionStreamElement
+import com.digitalasset.quickstart.iou.ClientUtil.workflowIdFromParty
+import com.digitalasset.quickstart.iou.DecodeUtil.decodeCreated
+import com.google.protobuf.ByteString
+import com.google.rpc.Code
+import com.typesafe.scalalogging.StrictLogging
+import scalaz.Tag
 
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.{Failure, Success}
-
-import scalaz.Tag
 
 // <doc-ref:imports>
 import com.digitalasset.ledger.client.binding.{Primitive => P}
@@ -38,16 +32,17 @@ import com.digitalasset.quickstart.iou.model.{Iou => M}
 
 object IouMain extends App with StrictLogging {
 
-  if (args.length != 2) {
-    logger.error("Usage: LEDGER_HOST LEDGER_PORT")
+  if (args.length != 3) {
+    logger.error("Usage: LEDGER_HOST LEDGER_PORT NCOMMANDS")
     System.exit(-1)
   }
 
   private val ledgerHost = args(0)
   private val ledgerPort = args(1).toInt
+  private val ncommands = args(2).toInt
 
   // <doc-ref:issuer-definition>
-  private val issuer = P.Party("Alice")
+  private val issuerHint = P.Party("Alice")
   // </doc-ref:issuer-definition>
   // <doc-ref:new-owner-definition>
   private val newOwner = P.Party("Bob")
@@ -86,7 +81,7 @@ object IouMain extends App with StrictLogging {
 
   private val offset0F: Future[LedgerOffset] = clientUtilF.flatMap(_.ledgerEnd)
 
-  private val issuerWorkflowId: WorkflowId = workflowIdFromParty(issuer)
+  private val issuerWorkflowId: WorkflowId = workflowIdFromParty(issuerHint)
   private val newOwnerWorkflowId: WorkflowId = workflowIdFromParty(newOwner)
 
   val newOwnerAcceptsAllTransfers: Future[Unit] = for {
@@ -115,81 +110,82 @@ object IouMain extends App with StrictLogging {
 
   // <doc-ref:iou-contract-instance>
   val iou = M.Iou(
-    issuer = issuer,
-    owner = issuer,
+    issuer = issuerHint,
+    owner = issuerHint,
     currency = "USD",
     amount = BigDecimal("1000.00"),
     observers = List())
   // </doc-ref:iou-contract-instance>
 
-  val ncommands = 1000
-
-  val issuerFlow: Future[Unit] = for {
+  val iouBenchFlow: Future[Unit] = for {
     clientUtil <- clientUtilF
     client <- clientF
     offset0 <- offset0F
-    _ = logger.info(s"Client API initialization completed, Ledger ID: ${clientUtil.toString}")
+    _ = println(s"Client API initialization completed, Ledger ID: ${clientUtil.toString}")
+
+    _ = println("Uploading package...")
+    darFileInputStream = this.getClass.getClassLoader.getResourceAsStream("quickstart-0.0.1.dar")
+    _ <- client.packageManagementClient.uploadDarFile(
+      ByteString.readFrom(darFileInputStream)
+    ).recover {
+      case err => sys.error(s"Package upload failed: $err")
+    }
+    _ = darFileInputStream.close
+
+    _ = println(s"Allocating party with hint '$issuerHint'")
+    issuer <- client.partyManagementClient.allocateParty(Some(Tag.unwrap(issuerHint)), Some(Tag.unwrap(issuerHint)))
+        .map { result =>
+          println(s"Allocated party '${result.party}'")
+          result.party
+        }
+        .recover {
+          case _ =>
+            println("Party already existed, reusing.")
+            Tag.unwrap(issuerHint)
+        }
 
     // <doc-ref:submit-iou-create-command>
     createCmd = iou.create
 
     t0 = System.nanoTime
 
+    _ = print(s"Submitting $ncommands Iou creations: ")
     _ <- Future.sequence(
-      (1 to ncommands).toSeq.map { _ =>
-        clientUtil.submitCommand(issuer, issuerWorkflowId, createCmd).map { _ =>
-          //logger.info(s"$issuer sent create command: $createCmd")
+      (1 to ncommands).map { _ =>
+        clientUtil.submitCommand(P.Party(issuer), issuerWorkflowId, createCmd)
+          .map { _ =>
+            print(".")
+          }
+          .recover {
+            case _ => print("X")
+          }
         }
-      }
     )
+    _ = println(s"\nWaiting for $ncommands completions: ")
 
     _ <-
-      client.commandClient.completionSource(Seq(Tag.unwrap(issuer)), offset0)
+      client.commandClient.completionSource(Seq(issuer), offset0)
         .collect {
           case x: CompletionStreamElement.CompletionElement =>
-            //println(s"got completion: $x")
+            if (x.completion.getStatus.code == Code.OK.getNumber)
+              print(".")
+            else
+              print("X")
             x
         }
         .take(ncommands)
         .runWith(Sink.ignore)(amat)
 
+    _ = println("")
     t1 = System.nanoTime
-
-    // </doc-ref:submit-iou-create-command>
-
-    /*
-    tx0 <- clientUtil.nextTransaction(issuer, offset0)(amat)
-    _ = logger.info(s"$issuer received transaction: $tx0")
-    iouContract <- toFuture(decodeCreated[M.Iou](tx0))
-    _ = logger.info(s"$issuer received contract: $iouContract")
-
-    offset1 <- clientUtil.ledgerEnd
-
-    // <doc-ref:iou-exercise-transfer-cmd>
-    exerciseCmd = iouContract.contractId.exerciseIou_Transfer(actor = issuer, newOwner = newOwner)
-    // </doc-ref:iou-exercise-transfer-cmd>
-    _ <- clientUtil.submitCommand(issuer, issuerWorkflowId, exerciseCmd)
-    _ = logger.info(s"$issuer sent exercise command: $exerciseCmd")
-    _ = logger.info(s"$issuer transferred IOU: $iouContract to: $newOwner")
-
-    tx1 <- clientUtil.nextTransaction(issuer, offset1)(amat)
-    _ = logger.info(s"$issuer received final transaction: $tx1")
-    archivedIouContractId <- toFuture(decodeArchived[M.Iou](tx1)): Future[P.ContractId[M.Iou]]
-    _ = logger.info(
-      s"$issuer received Archive Event for the original IOU contract ID: $archivedIouContractId")
-    _ <- Future(assert(iouContract.contractId == archivedIouContractId))
-    iouTransferContract <- toFuture(decodeAllCreated[M.IouTransfer](tx1).headOption)
-    _ = logger.info(s"$issuer received confirmation for the IOU Transfer: $iouTransferContract")
-    */
-
   } yield {
     val millis = (t1 - t0) / 1000 / 1000
 
-    logger.info(s"completed $ncommands in ${millis}ms")
+    println(s"completed $ncommands in ${millis}ms")
 
   }
 
-  val returnCodeF: Future[Int] = issuerFlow.transform {
+  val returnCodeF: Future[Int] = iouBenchFlow.transform {
     case Success(_) =>
       logger.info("IOU flow completed.")
       Success(0)
